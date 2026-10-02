@@ -1,310 +1,250 @@
 #!/usr/bin/env python3
 """
-Phase 1: Fixed Unified Authentic Telugu Data Extraction Engine
-Fully updated Hugging Face Dataset configs, OpenSLR endpoints, and fallback handlers.
+Production Data Engine - Pure Telugu Corpus Generator
+Enforces strict regex file discovery + Unicode character-level script verification.
 """
 
 import os
 import sys
 import re
-import csv
-import json
 import time
 import hashlib
 import unicodedata
-import urllib.request
-from typing import Set, Tuple
-from datasets import load_dataset
-from tqdm import tqdm
+from typing import Set, List
+from huggingface_hub import hf_hub_download, HfApi
+import pyarrow.parquet as pq
+from dotenv import load_dotenv
 
-# ==============================================================================
-# CONFIGURATION & THRESHOLDS
-# ==============================================================================
-OUTPUT_CORPUS_FILE = "final_authentic_telugu_corpus.txt"
-MIN_LINE_LENGTH = 12
-MAX_LINE_LENGTH = 1500
-
+load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
-# Extraction Limits
-LIMIT_FLEURS = 100000
-LIMIT_SWECHA = 100000
-LIMIT_AKSHARANTAR = 350000
-LIMIT_SANGRAHA = 400000
-LIMIT_DRAVIDIAN_LANGTECH = 150000
-LIMIT_L3CUBE = 150000
-LIMIT_WIKIPEDIA = 200000
+OUTPUT_CORPUS_FILE = "final_authentic_telugu_corpus.txt"
+CACHE_DIR = os.path.join(os.getcwd(), "hf_parquet_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Regex Cleaning Patterns
+LIMITS = {
+    "FLEURS": 100_000,
+    "CC100": 100_000,
+    "Aksharantar": 350_000,
+    "SocialMedia": 150_000,
+    "Sangraha": 400_000,
+    "Glot500": 150_000,
+    "Wikipedia": 200_000,
+}
+
 URL_REGEX = re.compile(r'https?://\S+|www\.\S+')
 HTML_REGEX = re.compile(r'<.*?>')
 EXTRA_SPACES_REGEX = re.compile(r'\s+')
-TELUGU_SCRIPT_REGEX = re.compile(r'[\u0C00-\u0C7F]')
-LATIN_SCRIPT_REGEX = re.compile(r'[a-zA-Z]')
+
+# Unicode ranges for strict script validation
+TELUGU_SCRIPT = re.compile(r'[\u0C00-\u0C7F]')
+OTHER_INDIC_SCRIPTS = re.compile(r'[\u0900-\u0BF9\u0C80-\u0D7F]') # Devanagari, Bengali, Tamil, Kannada, Malayalam, etc.
 
 seen_hashes: Set[str] = set()
 
-stats = {
-    "total_raw_lines_processed": 0,
-    "total_unique_lines_saved": 0,
-    "telugu_script_lines": 0,
-    "tanglish_latin_lines": 0,
-    "nfc_normalized_fixes": 0,
-    "sources_collected": {}
-}
+# Optional: Reset output file on new run to avoid keeping old contaminated data
+if os.path.exists(OUTPUT_CORPUS_FILE):
+    print(f"📖 Existing corpus found. Resetting file to ensure 100% pure Telugu...")
+    os.remove(OUTPUT_CORPUS_FILE)
 
-# ==============================================================================
-# CLEANING & DEDUPLICATION CORE
-# ==============================================================================
-def clean_and_normalize(text: str) -> Tuple[str, bool]:
+
+def clean_text(text: str) -> str:
     if not text:
-        return "", False
-    
+        return ""
     normalized = unicodedata.normalize('NFC', str(text))
-    was_modified = (normalized != text)
-    
     text = URL_REGEX.sub('', normalized)
     text = HTML_REGEX.sub('', text)
-    text = EXTRA_SPACES_REGEX.sub(' ', text).strip()
-    
-    return text, was_modified
+    return EXTRA_SPACES_REGEX.sub(' ', text).strip()
 
-def is_valid_and_unique(text: str, source_name: str, file_handle) -> bool:
-    global stats
-    stats["total_raw_lines_processed"] += 1
-    
-    if not (MIN_LINE_LENGTH <= len(text) <= MAX_LINE_LENGTH):
+
+def is_pure_telugu(text: str, min_telugu_ratio: float = 0.70) -> bool:
+    """
+    Validates that the string contains authentic Telugu script.
+    Rejects other Indic scripts and ensures native script dominant presence.
+    """
+    if not text:
         return False
-    
-    line_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-    if line_hash in seen_hashes:
+
+    # 1. Reject if other Indic scripts are present
+    if OTHER_INDIC_SCRIPTS.search(text):
         return False
-    
-    seen_hashes.add(line_hash)
-    file_handle.write(text + "\n")
-    
-    stats["total_unique_lines_saved"] += 1
-    stats["sources_collected"][source_name] = stats["sources_collected"].get(source_name, 0) + 1
-    
-    has_telugu = bool(TELUGU_SCRIPT_REGEX.search(text))
-    has_latin = bool(LATIN_SCRIPT_REGEX.search(text))
-    
-    if has_telugu:
-        stats["telugu_script_lines"] += 1
-    elif has_latin:
-        stats["tanglish_latin_lines"] += 1
-        
-    return True
 
-# ==============================================================================
-# UPDATED EXTRACTOR MODULES
-# ==============================================================================
+    # 2. Count total alphabetic characters
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
 
-def extract_fleurs_and_spoken(file_handle):
-    """Source 1: Google FLEURS Telugu (High-quality spoken conversational transcripts)"""
-    print("\n[1/7] 🎙️ Extracting Spoken Telugu Transcripts (Google FLEURS te_in)...")
-    count = 0
+    # 3. Count Telugu characters
+    telugu_chars = TELUGU_SCRIPT.findall(text)
+    if not telugu_chars:
+        return False
+
+    # 4. Check Telugu script ratio
+    ratio = len(telugu_chars) / len(letters)
+    return ratio >= min_telugu_ratio
+
+
+def auto_discover_and_download(api: HfApi, repo_id: str, strict_regex: str, max_files: int = 10) -> List[str]:
+    """Dynamically finds and downloads matching Parquet files using strict regex pattern."""
+    downloaded_paths = []
+    pattern = re.compile(strict_regex)
+
     try:
-        ds = load_dataset("google/fleurs", "te_in", split="train", streaming=True, token=HF_TOKEN)
-        for row in ds:
-            raw_text = row.get("raw_transcription", row.get("transcription", ""))
-            text, fixed = clean_and_normalize(raw_text)
-            if fixed: stats["nfc_normalized_fixes"] += 1
-            
-            if is_valid_and_unique(text, "Google-FLEURS-Spoken", file_handle):
-                count += 1
-                if count >= LIMIT_FLEURS:
-                    break
-        print(f"  ✓ Added {count:,} spoken Telugu lines.")
+        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", token=HF_TOKEN)
+        parquet_files = [f for f in files if f.endswith(".parquet") and pattern.search(f)]
+
+        if not parquet_files:
+            print(f"  ⚠️ No files matching pattern '{strict_regex}' found in {repo_id}")
+            return []
+
+        parquet_files = parquet_files[:max_files]
+
+        for pf in parquet_files:
+            try:
+                local_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=pf,
+                    repo_type="dataset",
+                    cache_dir=CACHE_DIR,
+                    token=HF_TOKEN
+                )
+                downloaded_paths.append(local_path)
+            except Exception as e:
+                print(f"  ⚠️ Error downloading {pf} from {repo_id}: {e}")
+
     except Exception as e:
-        print(f"  ⚠️ Skipping FLEURS extraction: {e}")
+        print(f"  ⚠️ Failed to inspect repository {repo_id}: {e}")
 
-def extract_swecha_datasets(file_handle):
-    """Source 2: Swecha Telugu Dataset"""
-    print("\n[2/7] 🌾 Extracting Swecha Telugu Datasets...")
-    count = 0
-    swecha_repos = ["swechatelangana/chandamama-kathalu"]
-    
-    for repo in swecha_repos:
-        try:
-            ds = load_dataset(repo, split="train", streaming=True, token=HF_TOKEN)
-            for row in ds:
-                text_content = row.get("text", row.get("sentence", row.get("content", "")))
-                if not text_content:
-                    continue
-                
-                for line in str(text_content).split('\n'):
-                    text, fixed = clean_and_normalize(line)
-                    if fixed: stats["nfc_normalized_fixes"] += 1
-                    
-                    if is_valid_and_unique(text, "Swecha-Telugu", file_handle):
-                        count += 1
-                        if count >= LIMIT_SWECHA:
-                            break
-                if count >= LIMIT_SWECHA:
-                    break
-        except Exception as e:
-            print(f"  ⚠️ Swecha dataset skipped (Requires HF_TOKEN): {e}")
-            
-    print(f"  ✓ Added {count:,} lines from Swecha Datasets.")
+    return downloaded_paths
 
-def extract_aksharantar_tanglish(file_handle):
-    """Source 3: AI4Bharat Aksharantar (Fixed config: uses default + language filtering)"""
-    print("\n[3/7] 🔤 Extracting AI4Bharat Aksharantar (Authentic Tanglish)...")
-    count = 0
-    try:
-        ds = load_dataset("ai4bharat/Aksharantar", "default", split="train", streaming=True, token=HF_TOKEN)
-        for row in ds:
-            # Filter strictly for Telugu language pairs
-            lang = row.get("language", row.get("lang", ""))
-            if lang and lang != "te":
-                continue
-                
-            native = str(row.get("native word", "")).strip()
-            english = str(row.get("english word", "")).strip()
-            
-            if native and english:
-                combined_phrase, fixed = clean_and_normalize(f"{english} {native}")
-                if fixed: stats["nfc_normalized_fixes"] += 1
-                
-                if is_valid_and_unique(combined_phrase, "Aksharantar-Tanglish", file_handle):
-                    count += 1
-                    if count >= LIMIT_AKSHARANTAR:
-                        break
-        print(f"  ✓ Added {count:,} authentic Tanglish entries from Aksharantar.")
-    except Exception as e:
-        print(f"  ❌ Aksharantar Extraction Error: {e}")
 
-def extract_dravidian_langtech(file_handle):
-    """Source 4: Dravidian CodeMix (Real Social Media Tanglish & English Code-Mix)"""
-    print("\n[4/7] 💬 Extracting Dravidian Social Media Tanglish & Code-Mix...")
-    count = 0
-    repos = ["DravidianCodeMix/DravidianCodeMix", "dharunim/DravidianLangTech-Telugu"]
-    
-    for repo in repos:
-        try:
-            ds = load_dataset(repo, split="train", streaming=True, token=HF_TOKEN)
-            for row in ds:
-                raw_text = row.get("text", row.get("comment", ""))
-                text, fixed = clean_and_normalize(raw_text)
-                if fixed: stats["nfc_normalized_fixes"] += 1
-                
-                if is_valid_and_unique(text, "Dravidian-Social", file_handle):
-                    count += 1
-                    if count >= LIMIT_DRAVIDIAN_LANGTECH:
-                        break
-            if count > 0:
-                break
-        except Exception as e:
+def process_parquet_files(file_paths: List[str], candidate_columns: List[str], max_lines: int, file_handle) -> int:
+    """Parses local Parquet files and filters lines with strict Telugu validation."""
+    added = 0
+    for path in file_paths:
+        if not path or not os.path.exists(path):
             continue
-            
-    print(f"  ✓ Added {count:,} real social media code-mixed lines.")
 
-def extract_ai4bharat_sangraha(file_handle):
-    """Source 5: AI4Bharat Sangraha (Fixed config: uses 'verified' + row language filter)"""
-    print("\n[5/7] 📰 Extracting AI4Bharat Sangraha (Formal Telugu)...")
-    count = 0
-    try:
-        ds = load_dataset("ai4bharat/sangraha", "verified", split="train", streaming=True, token=HF_TOKEN)
-        for row in ds:
-            # Check row-level language tag for Telugu
-            lang = row.get("lang", row.get("language", ""))
-            if lang and lang != "tel_Telu":
-                continue
-                
-            raw_text = row.get("text", "")
-            for line in raw_text.split('\n'):
-                text, fixed = clean_and_normalize(line)
-                if fixed: stats["nfc_normalized_fixes"] += 1
-                
-                if is_valid_and_unique(text, "AI4Bharat-Sangraha", file_handle):
-                    count += 1
-                    if count >= LIMIT_SANGRAHA:
-                        break
-            if count >= LIMIT_SANGRAHA:
-                break
-        print(f"  ✓ Added {count:,} lines from AI4Bharat Sangraha.")
-    except Exception as e:
-        print(f"  ❌ Sangraha Error: {e}")
+        try:
+            parquet_file = pq.ParquetFile(path)
+            for row_group_idx in range(parquet_file.num_row_groups):
+                table = parquet_file.read_row_group(row_group_idx)
+                df = table.to_pandas()
 
-def extract_l3cube_telugu(file_handle):
-    """Source 6: L3Cube Telugu Corpus (Fixed repo name)"""
-    print("\n[6/7] 📚 Extracting L3Cube-Telugu Corpus...")
-    count = 0
-    try:
-        ds = load_dataset("l3cube-pune/telugu-corpus", split="train", streaming=True, token=HF_TOKEN)
-        for row in ds:
-            raw_text = row.get("text", "")
-            text, fixed = clean_and_normalize(raw_text)
-            if fixed: stats["nfc_normalized_fixes"] += 1
-            
-            if is_valid_and_unique(text, "L3Cube-Telugu", file_handle):
-                count += 1
-                if count >= LIMIT_L3CUBE:
+                target_col = next((col for col in candidate_columns if col in df.columns), None)
+
+                # Check for word mapping datasets (e.g. native word column)
+                if not target_col and "native word" in df.columns:
+                    for val in df["native word"].dropna():
+                        cleaned = clean_text(val)
+                        if is_pure_telugu(cleaned):
+                            h = hashlib.sha256(cleaned.encode('utf-8')).hexdigest()
+                            if h not in seen_hashes:
+                                seen_hashes.add(h)
+                                file_handle.write(cleaned + "\n")
+                                added += 1
+                                if added >= max_lines:
+                                    return added
+                    continue
+
+                if not target_col:
+                    continue
+
+                for raw_val in df[target_col].dropna():
+                    for raw_line in str(raw_val).split('\n'):
+                        cleaned = clean_text(raw_line)
+                        if len(cleaned) < 5 or len(cleaned) > 1500:
+                            continue
+
+                        # Strict Telugu verification step
+                        if not is_pure_telugu(cleaned):
+                            continue
+
+                        h = hashlib.sha256(cleaned.encode('utf-8')).hexdigest()
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            file_handle.write(cleaned + "\n")
+                            added += 1
+                            if added >= max_lines:
+                                return added
+                if added >= max_lines:
                     break
-        print(f"  ✓ Added {count:,} lines from L3Cube Telugu.")
-    except Exception as e:
-        print(f"  ⚠️ Skipping L3Cube: {e}")
+        except Exception as e:
+            print(f"  ⚠️ Error parsing Parquet file {os.path.basename(path)}: {e}")
 
-def extract_telugu_wikipedia(file_handle):
-    """Source 7: Wikimedia Telugu Wikipedia"""
-    print("\n[7/7] 🌐 Extracting Wikimedia Telugu Wikipedia...")
-    count = 0
-    try:
-        ds = load_dataset("wikimedia/wikipedia", "20231101.te", split="train", streaming=True, token=HF_TOKEN)
-        for row in ds:
-            raw_text = row.get("text", "")
-            for line in raw_text.split('\n'):
-                text, fixed = clean_and_normalize(line)
-                if fixed: stats["nfc_normalized_fixes"] += 1
-                
-                if is_valid_and_unique(text, "Wikipedia-Te", file_handle):
-                    count += 1
-                    if count >= LIMIT_WIKIPEDIA:
-                        break
-            if count >= LIMIT_WIKIPEDIA:
-                break
-        print(f"  ✓ Added {count:,} lines from Telugu Wikipedia.")
-    except Exception as e:
-        print(f"  ❌ Wikipedia Error: {e}")
+        if added >= max_lines:
+            break
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
+    return added
+
+
 def main():
     start_time = time.time()
     print("=" * 70)
-    print("🚀 PHASE 1: UNIFIED AUTHENTIC TELUGU DATA ENGINE (FIXED & AUDITED)")
+    print("🚀 PRODUCTION DATA ENGINE (STRICT PURE TELUGU)")
     print("=" * 70)
 
-    with open(OUTPUT_CORPUS_FILE, "w", encoding="utf-8") as out_f:
-        extract_fleurs_and_spoken(out_f)
-        extract_swecha_datasets(out_f)
-        extract_aksharantar_tanglish(out_f)
-        extract_dravidian_langtech(out_f)
-        extract_ai4bharat_sangraha(out_f)
-        extract_l3cube_telugu(out_f)
-        extract_telugu_wikipedia(out_f)
+    api = HfApi()
 
-    elapsed_time = time.time() - start_time
-    file_size_mb = os.path.getsize(OUTPUT_CORPUS_FILE) / (1024 * 1024)
+    with open(OUTPUT_CORPUS_FILE, "a", encoding="utf-8") as out_f:
+
+        # [1/7] FLEURS Spoken
+        print("\n[1/7] 🎙️ Processing Google FLEURS (te_in)...")
+        paths = auto_discover_and_download(api, "google/fleurs", strict_regex=r'te_in/')
+        added = process_parquet_files(paths, ["raw_transcription", "transcription", "sentence"], LIMITS["FLEURS"], out_f)
+        print(f"  ✓ Added {added:,} pure Telugu spoken lines.")
+
+        # [2/7] Open Telugu Stories / CC100
+        print("\n[2/7] 🌾 Processing CC100 (Telugu)...")
+        paths = auto_discover_and_download(api, "statmt/cc100", strict_regex=r'(^|/)te(/|\.|\_)')
+        added = process_parquet_files(paths, ["text"], LIMITS["CC100"], out_f)
+        print(f"  ✓ Added {added:,} story/web lines.")
+
+        # [3/7] Aksharantar Telugu
+        print("\n[3/7] 🔤 Processing AI4Bharat Aksharantar (Telugu only)...")
+        paths = auto_discover_and_download(api, "eswardivi/Aksharantar", strict_regex=r'(^|/)(te|tel)(/|\_)')
+        if not paths:
+            paths = auto_discover_and_download(api, "ai4bharat/Aksharantar", strict_regex=r'(^|/)(te|tel)(/|\_)')
+        added = process_parquet_files(paths, ["text"], LIMITS["Aksharantar"], out_f)
+        print(f"  ✓ Added {added:,} native Telugu entries.")
+
+        # [4/7] Social Media Code-Mix (Telugu only)
+        print("\n[4/7] 💬 Processing Dravidian Social Media (Telugu only)...")
+        paths = auto_discover_and_download(api, "community-datasets/offenseval_dravidian", strict_regex=r'(^|/)telugu(/|\_)')
+        if not paths:
+            paths = auto_discover_and_download(api, "dravidianlangtech/hope_edi", strict_regex=r'(^|/)telugu(/|\_)')
+        added = process_parquet_files(paths, ["text", "comment", "tweet", "sentence"], LIMITS["SocialMedia"], out_f)
+        print(f"  ✓ Added {added:,} social media lines.")
+
+        # [5/7] AI4Bharat Sangraha (Native Telugu Script only: tel_Telu)
+        print("\n[5/7] 📰 Processing AI4Bharat Sangraha (tel_Telu script)...")
+        paths = auto_discover_and_download(api, "ai4bharat/sangraha", strict_regex=r'(^|/)(tel_Telu|verified/tel)(/|\_)')
+        added = process_parquet_files(paths, ["text"], LIMITS["Sangraha"], out_f)
+        print(f"  ✓ Added {added:,} formal lines.")
+
+        # [6/7] Glot500 Telugu Corpus
+        print("\n[6/7] 📚 Processing Glot500 Telugu Corpus...")
+        paths = auto_discover_and_download(api, "cis-lmu/Glot500", strict_regex=r'(^|/)tel_Telu(/|\_)')
+        added = process_parquet_files(paths, ["text"], LIMITS["Glot500"], out_f)
+        print(f"  ✓ Added {added:,} monolingual lines.")
+
+        # [7/7] Wikimedia Telugu Wikipedia
+        print("\n[7/7] 🌐 Processing Wikimedia Telugu Wikipedia (20231101.te)...")
+        paths = auto_discover_and_download(api, "wikimedia/wikipedia", strict_regex=r'20231101\.te/')
+        added = process_parquet_files(paths, ["text"], LIMITS["Wikipedia"], out_f)
+        print(f"  ✓ Added {added:,} Wikipedia lines.")
+
+    elapsed = time.time() - start_time
+    file_size_mb = os.path.getsize(OUTPUT_CORPUS_FILE) / (1024 * 1024) if os.path.exists(OUTPUT_CORPUS_FILE) else 0
 
     print("\n" + "=" * 70)
-    print("📊 PHASE 1 FINAL EXTRACTION & AUDIT REPORT")
+    print("✅ PURE TELUGU CORPUS BUILD COMPLETE")
     print("=" * 70)
-    print(f"Total Raw Lines Processed : {stats['total_raw_lines_processed']:,}")
-    print(f"Total Unique Lines Saved   : {stats['total_unique_lines_saved']:,}")
-    print(f"Pure Telugu Script Lines   : {stats['telugu_script_lines']:,} ({stats['telugu_script_lines']/max(1, stats['total_unique_lines_saved'])*100:.1f}%)")
-    print(f"Tanglish / Latin Lines     : {stats['tanglish_latin_lines']:,} ({stats['tanglish_latin_lines']/max(1, stats['total_unique_lines_saved'])*100:.1f}%)")
-    print(f"Unicode NFC Normalization  : {stats['nfc_normalized_fixes']:,} lines canonicalized")
-    print(f"Output File Size          : {file_size_mb:.2f} MB")
-    print(f"Total Execution Time      : {elapsed_time:.2f} seconds")
-    print("-" * 70)
-    print("Breakdown by Source:")
-    for src, cnt in stats["sources_collected"].items():
-        print(f"  • {src:<25}: {cnt:,} lines")
+    print(f"Total Unique Lines Saved : {len(seen_hashes):,}")
+    print(f"Corpus File Size         : {file_size_mb:.2f} MB")
+    print(f"Total Execution Time     : {elapsed:.2f} seconds")
     print("=" * 70)
-    print(f"✅ Master Corpus Saved To: {os.path.abspath(OUTPUT_CORPUS_FILE)}")
+
 
 if __name__ == "__main__":
     main()

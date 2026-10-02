@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+hf_parquet_cache/
+telugu_akshara_unigram_64k/
+final_authentic_telugu_corpus.txt
