@@ -219,4 +219,8 @@ __marimo__/
 
 hf_parquet_cache/
 telugu_akshara_unigram_64k/
-final_authentic_telugu_corpus.txt
+tanglish_dialect_corpus.txt
+telugu_tanglish_unigram_128k/
+telugu_tanglish_bpe_128k/
+telugu_tanglish_master_128k/
+final_authentic_telugu_corpus.txt
